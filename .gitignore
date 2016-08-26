@@ -1,4 +1,5 @@
 bin.X86
 lib.X86
 samples/*/obj.X86
+src/obj.X86
 include

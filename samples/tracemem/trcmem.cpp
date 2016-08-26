@@ -148,6 +148,20 @@ BOOL (WINAPI * Real_CreateProcessW)(LPCWSTR a0,
                                     LPPROCESS_INFORMATION a9)
     = CreateProcessW;
 
+NTSTATUS (__stdcall * Real_NtAllocateVirtualMemory)(HANDLE a0,
+                                                    PVOID* a1,
+                                                    ULONG_PTR a2,
+                                                    PSIZE_T a3,
+                                                    ULONG a4,
+                                                    ULONG a5)
+    = NULL;
+
+USHORT (WINAPI * CaptureStackBackTrace)(ULONG,
+                                        ULONG,
+                                        PVOID*,
+                                        PULONG)
+    = NULL;
+
 //////////////////////////////////////////////////////////////////////////////
 // Detours
 //
@@ -213,6 +227,37 @@ BOOL WINAPI Mine_CreateProcessW(LPCWSTR lpApplicationName,
     return rv;
 }
 
+NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
+                                                PVOID *BaseAddress,
+                                                ULONG_PTR ZeroBits,
+                                                PSIZE_T RegionSize,
+                                                ULONG AllocationType,
+                                                ULONG Protect)
+{
+    NTSTATUS rv = 0;
+    __try {
+        rv = Real_NtAllocateVirtualMemory(ProcessHandle, BaseAddress, ZeroBits,
+                                          RegionSize, AllocationType, Protect);
+    } __finally {
+        // TODO: 1) use mutex to avoid reentrant, 2) symbolize, 3) record by
+        // stack, probably store the allocatios by stack hash so we can count
+        // how many times a stack is allocating, 4) filter out samples contain
+        // some specific frame, e.g., RtlHeapAlloc, 5) we need to ignore
+        // unaligned allocations on an aligned reserve chunk
+        _Print("NtAllocateVirtualMemory(%p, %x, %x, %x) -> %x %p\n", *BaseAddress,
+               *RegionSize, AllocationType, Protect, rv, *BaseAddress);
+        // We're interested in the allocations that size not aligned to 64K.
+        if (PtrToUlong(*BaseAddress) & 0xffff) {
+            void* stack[16];
+            int count = (CaptureStackBackTrace)(0, 16, stack, NULL);
+            for (int i = 0; i < count; ++i) {
+                _Print("  [%d] %lx\n", i, stack[i], SymFromAddr());
+            }
+        }
+    };
+    return rv;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // AttachDetours
 //
@@ -256,11 +301,28 @@ VOID DetDetach(PVOID *ppbReal, PVOID pbMine, PCHAR psz)
 
 LONG AttachDetours(VOID)
 {
+    Real_NtAllocateVirtualMemory =
+        ((NTSTATUS (__stdcall *)(HANDLE,
+                                 PVOID*,
+                                 ULONG_PTR,
+                                 PSIZE_T,
+                                 ULONG,
+                                 ULONG))
+        DetourFindFunction("ntdll.dll", "NtAllocateVirtualMemory"));
+
+    CaptureStackBackTrace =
+        ((USHORT (WINAPI *)(ULONG,
+                            ULONG,
+                            PVOID*,
+                            PULONG))
+        DetourFindFunction("kernel32.dll", "RtlCaptureStackBackTrace"));
+
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
     ATTACH(CreateProcessW);
-    ATTACH(HeapAlloc);
+//    ATTACH(HeapAlloc);
+    ATTACH(NtAllocateVirtualMemory);
 
     return DetourTransactionCommit();
 }
@@ -271,7 +333,8 @@ LONG DetachDetours(VOID)
     DetourUpdateThread(GetCurrentThread());
 
     DETACH(CreateProcessW);
-    DETACH(HeapAlloc);
+//    DETACH(HeapAlloc);
+    DETACH(NtAllocateVirtualMemory);
 
     return DetourTransactionCommit();
 }
