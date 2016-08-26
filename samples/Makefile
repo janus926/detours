@@ -27,7 +27,7 @@ all:
     @$(MAKE) /NOLOGO /$(MAKEFLAGS)
     cd "$(MAKEDIR)\withdll"
     @$(MAKE) /NOLOGO /$(MAKEFLAGS)
-!IF "$(DETOURS_TARGET_PROCESSOR)" == "X86"
+!IF 0
     cd "$(MAKEDIR)\cping"
     @$(MAKE) /NOLOGO /$(MAKEFLAGS)
 !ENDIF
@@ -53,7 +53,7 @@ all:
     @$(MAKE) /NOLOGO /$(MAKEFLAGS)
     cd "$(MAKEDIR)\findfunc"
     @$(MAKE) /NOLOGO /$(MAKEFLAGS)
-!IF "$(DETOURS_TARGET_PROCESSOR)" != "ARM"
+!IF 0
     cd "$(MAKEDIR)\member"
     @$(MAKE) /NOLOGO /$(MAKEFLAGS)
 !ENDIF
