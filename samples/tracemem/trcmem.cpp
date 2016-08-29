@@ -51,6 +51,8 @@
 //////////////////////////////////////////////////////////////////////////////
 static HMODULE s_hInst = NULL;
 static CHAR s_szDllPath[MAX_PATH];
+static CRITICAL_SECTION s_lock;
+
 
 VOID _PrintEnter(const CHAR *psz, ...);
 VOID _PrintExit(const CHAR *psz, ...);
@@ -239,10 +241,11 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
         rv = Real_NtAllocateVirtualMemory(ProcessHandle, BaseAddress, ZeroBits,
                                           RegionSize, AllocationType, Protect);
     } __finally {
-        // TODO: 1) use mutex to avoid reentrant, 2) symbolize, 3) record by
-        // stack, probably store the allocatios by stack hash so we can count
-        // how many times a stack is allocating, 4) filter out samples contain
-        // some specific frame, e.g., RtlHeapAlloc, 5) we need to ignore
+        EnterCriticalSection(&s_lock); 
+        // TODO: 1) use mutex to avoid reentrant, 2) symbolize by SymFromAddr(),
+        // 3) record by stack, probably store the allocatios by stack hash so we
+        // can count how many times a stack is allocating, 4) filter out samples
+        // contain some specific frame, e.g., RtlHeapAlloc, 5) we need to ignore
         // unaligned allocations on an aligned reserve chunk
         _Print("NtAllocateVirtualMemory(%p, %x, %x, %x) -> %x %p\n", *BaseAddress,
                *RegionSize, AllocationType, Protect, rv, *BaseAddress);
@@ -251,9 +254,10 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
             void* stack[16];
             int count = (CaptureStackBackTrace)(0, 16, stack, NULL);
             for (int i = 0; i < count; ++i) {
-                _Print("  [%d] %lx\n", i, stack[i], SymFromAddr());
+                _Print("  [%d] %lx\n", i, stack[i]);
             }
         }
+        LeaveCriticalSection(&s_lock); 
     };
     return rv;
 }
@@ -521,6 +525,8 @@ BOOL ProcessAttach(HMODULE hDll)
     Real_GetModuleFileNameA(s_hInst, s_szDllPath, ARRAYSIZE(s_szDllPath));
     Real_GetModuleFileNameW(NULL, wzExePath, ARRAYSIZE(wzExePath));
 
+    InitializeCriticalSectionAndSpinCount(&s_lock, 0x400);
+
     SyelogOpen("trcmem" DETOURS_STRINGIFY(DETOURS_BITS), SYELOG_FACILITY_APPLICATION);
     Syelog(SYELOG_SEVERITY_INFORMATION, "##########################################\n");
     Syelog(SYELOG_SEVERITY_INFORMATION, "### %ls\n", wzExePath);
@@ -548,6 +554,8 @@ BOOL ProcessDetach(HMODULE hDll)
 
     Syelog(SYELOG_SEVERITY_NOTICE, "### Closing.\n");
     SyelogClose(FALSE);
+
+    DeleteCriticalSection(&s_lock);
 
     if (s_nTlsIndent >= 0) {
         TlsFree(s_nTlsIndent);
