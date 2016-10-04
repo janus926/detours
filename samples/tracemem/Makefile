@@ -40,7 +40,7 @@ $(BIND)\trcmem$(DETOURS_BITS).dll : $(OBJD)\trcmem.obj $(OBJD)\trcmem.res $(DEPS
         /link $(LINKFLAGS) /incremental:no /subsystem:console \
         /entry:$(DLLENTRY) \
         /export:DetourFinishHelperProcess,@1,NONAME \
-        $(LIBS)
+        $(LIBS) dbghelp.lib advapi32.lib
 
 $(OBJD)\trcmem$(DETOURS_BITS).bsc : $(OBJD)\trcmem.obj
     bscmake /v /n /o $@ $(OBJD)\trcmem.sbr

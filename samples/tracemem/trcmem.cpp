@@ -10,10 +10,12 @@
 #define WIN32
 #define NT
 
-#define DBG_TRACE   0
+#define DBG_TRACE           0
 
 #include <windows.h>
+#include <dbghelp.h>
 #include <stdio.h>
+#include <map>
 #include "detours.h"
 #include "syelog.h"
 
@@ -27,6 +29,8 @@
 #define ENUMRESTYPEPROCA    PVOID
 #define ENUMRESTYPEPROCW    PVOID
 #define STGOPTIONS          PVOID
+
+#define STACK_DEPTH         64
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -51,8 +55,6 @@
 //////////////////////////////////////////////////////////////////////////////
 static HMODULE s_hInst = NULL;
 static CHAR s_szDllPath[MAX_PATH];
-static CRITICAL_SECTION s_lock;
-
 
 VOID _PrintEnter(const CHAR *psz, ...);
 VOID _PrintExit(const CHAR *psz, ...);
@@ -158,11 +160,30 @@ NTSTATUS (__stdcall * Real_NtAllocateVirtualMemory)(HANDLE a0,
                                                     ULONG a5)
     = NULL;
 
+NTSTATUS (__stdcall * Real_NtFreeVirtualMemory)(HANDLE a0,
+                                                PVOID* a1,
+                                                PSIZE_T a2,
+                                                ULONG a3)
+    = NULL;
+
 USHORT (WINAPI * CaptureStackBackTrace)(ULONG,
                                         ULONG,
                                         PVOID*,
                                         PULONG)
     = NULL;
+
+BOOL (WINAPI * Real_CreateProcessAsUserW)(HANDLE a0,
+                                          LPCWSTR a1,
+                                          LPWSTR a2,
+                                          LPSECURITY_ATTRIBUTES a3,
+                                          LPSECURITY_ATTRIBUTES a4,
+                                          BOOL a5,
+                                          DWORD a6,
+                                          LPVOID a7,
+                                          LPCWSTR a8,
+                                          LPSTARTUPINFOW a9,
+                                          LPPROCESS_INFORMATION a10)
+    = CreateProcessAsUserW;
 
 //////////////////////////////////////////////////////////////////////////////
 // Detours
@@ -229,6 +250,40 @@ BOOL WINAPI Mine_CreateProcessW(LPCWSTR lpApplicationName,
     return rv;
 }
 
+static HANDLE s_hMyHeap;
+
+template<class T>
+struct MyHeapAllocator
+{
+    typedef T value_type;
+    MyHeapAllocator() { if (!s_hMyHeap) s_hMyHeap = HeapCreate(0, 0, 0); }
+    ~MyHeapAllocator() { if (s_hMyHeap) HeapDestroy(s_hMyHeap); }
+    template<class U> MyHeapAllocator(const MyHeapAllocator<U>& other) {}
+    template<class U> bool operator==(const MyHeapAllocator<U>&) { return true; }
+    template<class U> bool operator!=(const MyHeapAllocator<U>&) { return false; }
+    T* allocate(size_t n) {
+        return static_cast<T*>(HeapAlloc(s_hMyHeap, 0, n * sizeof(T)));
+    }
+    void deallocate(T* p, size_t n) {
+        HeapFree(s_hMyHeap, 0, p);
+    }
+};
+
+typedef struct
+{
+    PVOID addr;
+    SIZE_T size;
+    ULONG type;
+    ULONG protect;
+} Allocation;
+
+typedef std::map<ULONG, PVOID*, std::less<ULONG>, MyHeapAllocator<std::pair<ULONG, PVOID*>>> StackMap;
+typedef std::multimap<ULONG, Allocation*, std::less<ULONG>, MyHeapAllocator<std::pair<ULONG, Allocation*>>> AllocMap;
+
+static StackMap s_stacks;
+static AllocMap s_allocs;
+static LONG s_nTlsNestAlloc;
+
 NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
                                                 PVOID *BaseAddress,
                                                 ULONG_PTR ZeroBits,
@@ -236,29 +291,112 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
                                                 ULONG AllocationType,
                                                 ULONG Protect)
 {
+    _PrintEnter("NtAllocateVirtualMemory(%p,%p,%x,%Iu,%x,%x)\n",
+                ProcessHandle,
+                *BaseAddress,
+                ZeroBits,
+                *RegionSize,
+                AllocationType,
+                Protect);
+
     NTSTATUS rv = 0;
     __try {
         rv = Real_NtAllocateVirtualMemory(ProcessHandle, BaseAddress, ZeroBits,
                                           RegionSize, AllocationType, Protect);
-    } __finally {
-        EnterCriticalSection(&s_lock); 
-        // TODO: 1) use mutex to avoid reentrant, 2) symbolize by SymFromAddr(),
-        // 3) record by stack, probably store the allocatios by stack hash so we
-        // can count how many times a stack is allocating, 4) filter out samples
-        // contain some specific frame, e.g., RtlHeapAlloc, 5) we need to ignore
-        // unaligned allocations on an aligned reserve chunk
-        _Print("NtAllocateVirtualMemory(%p, %x, %x, %x) -> %x %p\n", *BaseAddress,
-               *RegionSize, AllocationType, Protect, rv, *BaseAddress);
-        // We're interested in the allocations that size not aligned to 64K.
-        if (PtrToUlong(*BaseAddress) & 0xffff) {
-            void* stack[16];
-            int count = (CaptureStackBackTrace)(0, 16, stack, NULL);
-            for (int i = 0; i < count; ++i) {
-                _Print("  [%d] %lx\n", i, stack[i]);
+
+        // We care only the case when the allocation is not 64k-aligned.
+        if (PtrToUlong(*RegionSize) & 0xffff && !TlsGetValue(s_nTlsNestAlloc)) {
+            TlsSetValue(s_nTlsNestAlloc, (LPVOID)1);
+
+            ULONG hash;
+            PVOID* bt = (PVOID*)HeapAlloc(s_hMyHeap, HEAP_ZERO_MEMORY,
+                                          sizeof(PVOID) * STACK_DEPTH);
+            (CaptureStackBackTrace)(1, STACK_DEPTH, bt, &hash);
+            if (s_stacks.find(hash) != s_stacks.end()) {
+                HeapFree(s_hMyHeap, 0, bt);
+            } else {
+                s_stacks.insert(std::pair<ULONG, PVOID*>(hash, bt));
             }
+
+            Allocation* alloc = (Allocation*)HeapAlloc(s_hMyHeap, HEAP_ZERO_MEMORY,
+                                                       sizeof(Allocation));
+            alloc->addr = *BaseAddress;
+            alloc->size = *RegionSize;
+            alloc->type = AllocationType;
+            alloc->protect = Protect;
+            s_allocs.insert(std::pair<ULONG, Allocation*>(hash, alloc));
+
+            TlsSetValue(s_nTlsNestAlloc, (LPVOID)0);
         }
-        LeaveCriticalSection(&s_lock); 
+    } __finally {
+        _PrintExit("NtAllocateVirtualMemory(,,,,,) -> %x %p\n", rv, *BaseAddress);
     };
+    return rv;
+}
+
+NTSTATUS __stdcall Mine_NtFreeVirtualMemory(HANDLE ProcessHandle,
+                                            PVOID *BaseAddress,
+                                            PSIZE_T RegionSize,
+                                            ULONG FreeType)
+{
+    _PrintEnter("NtFreeVirtualMemory(%p,%p,%Iu,%x)\n",
+                ProcessHandle,
+                BaseAddress,
+                RegionSize,
+                FreeType);
+
+    NTSTATUS rv = 0;
+    __try {
+        rv = Real_NtFreeVirtualMemory(ProcessHandle, BaseAddress, RegionSize,
+                                      FreeType);
+    } __finally {
+        _PrintExit("NtFreeVirtualMemory(,,,) -> %x\n", rv);
+    }
+    return rv;
+}
+
+BOOL WINAPI Mine_CreateProcessAsUserW(HANDLE hToken,
+                                      LPCWSTR lpApplicationName,
+                                      LPWSTR lpCommandLine,
+                                      LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                      LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                      BOOL bInheritHandles,
+                                      DWORD dwCreationFlags,
+                                      LPVOID lpEnvironment,
+                                      LPCWSTR lpCurrentDirectory,
+                                      LPSTARTUPINFOW lpStartupInfo,
+                                      LPPROCESS_INFORMATION lpProcessInformation)
+{
+    _PrintEnter("CreateProcessAsUserW(%p,%ls,%ls,%p,%p,%x,%x,%p,%ls,%p,%p)\n",
+                hToken,
+                lpApplicationName,
+                lpCommandLine,
+                lpProcessAttributes,
+                lpThreadAttributes,
+                bInheritHandles,
+                dwCreationFlags,
+                lpEnvironment,
+                lpCurrentDirectory,
+                lpStartupInfo,
+                lpProcessInformation);
+
+    BOOL rv;
+    __try {
+        // TODO: Maybe DetourCreateProcessWithDllExW?
+        rv = Real_CreateProcessAsUserW(hToken,
+                                       lpApplicationName,
+                                       lpCommandLine,
+                                       lpProcessAttributes,
+                                       lpThreadAttributes,
+                                       bInheritHandles,
+                                       dwCreationFlags,
+                                       lpEnvironment,
+                                       lpCurrentDirectory,
+                                       lpStartupInfo,
+                                       lpProcessInformation);
+    } __finally {
+        _PrintExit("CreateProcessAsUser(,,,,,,,,,,) -> %x\n", rv);
+    }
     return rv;
 }
 
@@ -314,6 +452,13 @@ LONG AttachDetours(VOID)
                                  ULONG))
         DetourFindFunction("ntdll.dll", "NtAllocateVirtualMemory"));
 
+    Real_NtFreeVirtualMemory =
+        ((NTSTATUS (__stdcall *)(HANDLE,
+                                 PVOID*,
+                                 PSIZE_T,
+                                 ULONG))
+        DetourFindFunction("ntdll.dll", "NtFreeVirtualMemory"));
+
     CaptureStackBackTrace =
         ((USHORT (WINAPI *)(ULONG,
                             ULONG,
@@ -325,8 +470,10 @@ LONG AttachDetours(VOID)
     DetourUpdateThread(GetCurrentThread());
 
     ATTACH(CreateProcessW);
-//    ATTACH(HeapAlloc);
+    ATTACH(CreateProcessAsUserW);
+    ATTACH(HeapAlloc);
     ATTACH(NtAllocateVirtualMemory);
+    ATTACH(NtFreeVirtualMemory);
 
     return DetourTransactionCommit();
 }
@@ -336,9 +483,11 @@ LONG DetachDetours(VOID)
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
 
+    DETACH(CreateProcessAsUserW);
     DETACH(CreateProcessW);
-//    DETACH(HeapAlloc);
+    DETACH(HeapAlloc);
     DETACH(NtAllocateVirtualMemory);
+    DETACH(NtFreeVirtualMemory);
 
     return DetourTransactionCommit();
 }
@@ -349,6 +498,7 @@ static BOOL s_bLog = FALSE;
 static LONG s_nTlsIndent = -1;
 static LONG s_nTlsThread = -1;
 static LONG s_nThreadCnt = 0;
+static CHAR s_szBuf[1024];
 
 VOID _PrintEnter(const CHAR *psz, ...)
 {
@@ -365,9 +515,8 @@ VOID _PrintEnter(const CHAR *psz, ...)
     }
 
     if (s_bLog && psz) {
-        CHAR szBuf[1024];
-        PCHAR pszBuf = szBuf;
-        PCHAR pszEnd = szBuf + ARRAYSIZE(szBuf) - 1;
+        PCHAR pszBuf = s_szBuf;
+        PCHAR pszEnd = s_szBuf + ARRAYSIZE(s_szBuf) - 1;
         LONG nLen = (nIndent > 0) ? (nIndent < 35 ? nIndent * 2 : 70) : 0;
         *pszBuf++ = (CHAR)('0' + ((nThread / 100) % 10));
         *pszBuf++ = (CHAR)('0' + ((nThread / 10) % 10));
@@ -384,7 +533,7 @@ VOID _PrintEnter(const CHAR *psz, ...)
             // Copy characters.
         }
         *pszEnd = '\0';
-        SyelogV(SYELOG_SEVERITY_INFORMATION, szBuf, args);
+        SyelogV(SYELOG_SEVERITY_INFORMATION, s_szBuf, args);
 
         va_end(args);
     }
@@ -407,9 +556,8 @@ VOID _PrintExit(const CHAR *psz, ...)
     }
 
     if (s_bLog && psz) {
-        CHAR szBuf[1024];
-        PCHAR pszBuf = szBuf;
-        PCHAR pszEnd = szBuf + ARRAYSIZE(szBuf) - 1;
+        PCHAR pszBuf = s_szBuf;
+        PCHAR pszEnd = s_szBuf + ARRAYSIZE(s_szBuf) - 1;
         LONG nLen = (nIndent > 0) ? (nIndent < 35 ? nIndent * 2 : 70) : 0;
         *pszBuf++ = (CHAR)('0' + ((nThread / 100) % 10));
         *pszBuf++ = (CHAR)('0' + ((nThread / 10) % 10));
@@ -427,7 +575,7 @@ VOID _PrintExit(const CHAR *psz, ...)
         }
         *pszEnd = '\0';
         SyelogV(SYELOG_SEVERITY_INFORMATION,
-                szBuf, args);
+                s_szBuf, args);
 
         va_end(args);
     }
@@ -448,9 +596,8 @@ VOID _Print(const CHAR *psz, ...)
     }
 
     if (s_bLog && psz) {
-        CHAR szBuf[1024];
-        PCHAR pszBuf = szBuf;
-        PCHAR pszEnd = szBuf + ARRAYSIZE(szBuf) - 1;
+        PCHAR pszBuf = s_szBuf;
+        PCHAR pszEnd = s_szBuf + ARRAYSIZE(s_szBuf) - 1;
         LONG nLen = (nIndent > 0) ? (nIndent < 35 ? nIndent * 2 : 70) : 0;
         *pszBuf++ = (CHAR)('0' + ((nThread / 100) % 10));
         *pszBuf++ = (CHAR)('0' + ((nThread / 10) % 10));
@@ -468,7 +615,7 @@ VOID _Print(const CHAR *psz, ...)
         }
         *pszEnd = '\0';
         SyelogV(SYELOG_SEVERITY_INFORMATION,
-                szBuf, args);
+                s_szBuf, args);
 
         va_end(args);
     }
@@ -518,14 +665,13 @@ BOOL ProcessAttach(HMODULE hDll)
     s_bLog = FALSE;
     s_nTlsIndent = TlsAlloc();
     s_nTlsThread = TlsAlloc();
+    s_nTlsNestAlloc = TlsAlloc();
 
     WCHAR wzExePath[MAX_PATH];
 
     s_hInst = hDll;
     Real_GetModuleFileNameA(s_hInst, s_szDllPath, ARRAYSIZE(s_szDllPath));
     Real_GetModuleFileNameW(NULL, wzExePath, ARRAYSIZE(wzExePath));
-
-    InitializeCriticalSectionAndSpinCount(&s_lock, 0x400);
 
     SyelogOpen("trcmem" DETOURS_STRINGIFY(DETOURS_BITS), SYELOG_FACILITY_APPLICATION);
     Syelog(SYELOG_SEVERITY_INFORMATION, "##########################################\n");
@@ -542,6 +688,77 @@ BOOL ProcessAttach(HMODULE hDll)
     return TRUE;
 }
 
+VOID DumpTraces(VOID)
+{
+    static CHAR s_symbuf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)];
+    HANDLE hProcess = GetCurrentProcess();
+    CRITICAL_SECTION lock;
+
+    InitializeCriticalSection(&lock);
+    EnterCriticalSection(&lock);
+
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    // TODO: get sympath from command line or env
+    if (!SymInitialize(hProcess, "C:\\w\\fx\\mc\\obj-i686-pc-mingw32\\dist\\bin;"
+            "SRV*c:\\symcache\\*http://msdl.microsoft.com/download/symbols", TRUE)) {
+        DWORD error = GetLastError();
+        Syelog(SYELOG_SEVERITY_FATAL, "### Error initializing the symbol handler"
+               ": %d\n", error);
+    }
+
+    PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)s_symbuf;
+    DWORD64 dwDisplacement = 0;
+    IMAGEHLP_MODULE64 module;
+
+    memset(&module, 0, sizeof(module));
+    module.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
+    memset(s_symbuf, 0, sizeof(s_symbuf));
+    pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    pSymbol->MaxNameLen = MAX_SYM_NAME;
+
+    // TODO: apply filter
+    for (StackMap::iterator it = s_stacks.begin(); it != s_stacks.end(); ++it) {
+        INT i;
+        PVOID* stack = it->second;
+        Syelog(SYELOG_SEVERITY_INFORMATION, "0x%x %p\n", it->first, it->second);
+
+        /* Output the stack symbols. */
+        for (i = 0; i < STACK_DEPTH && stack[i]; ++i) {
+            SymGetModuleInfo64(hProcess, (DWORD64)stack[i], &module);
+            SymFromAddr(hProcess, (DWORD64)stack[i], &dwDisplacement, pSymbol);
+
+            Syelog(SYELOG_SEVERITY_INFORMATION, "  [%d] %p %s!%s+0x%x\n", i,
+                   stack[i], module.ModuleName, pSymbol->Name, dwDisplacement);
+
+            memset(&module, 0, sizeof(module));
+            module.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
+            memset(s_symbuf, 0, sizeof(s_symbuf));
+            pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            pSymbol->MaxNameLen = MAX_SYM_NAME;
+        }
+        HeapFree(s_hMyHeap, 0, stack);
+
+        /* List s_allocs from the current stack. */
+        std::pair <AllocMap::iterator, AllocMap::iterator> allocs =
+            s_allocs.equal_range(it->first);
+        i = 0;
+        for (AllocMap::iterator it = allocs.first; it != allocs.second; ++it) {
+            Syelog(SYELOG_SEVERITY_INFORMATION, "  #%d %p %lu %x %x\n", ++i,
+                   it->second->addr, it->second->size, it->second->type,
+                   it->second->protect);
+        }
+    }
+
+    if (!SymCleanup(hProcess)) {
+        DWORD error = GetLastError();
+        Syelog(SYELOG_SEVERITY_FATAL, "### Error terminating the symbol handler"
+               ": %d\n", error);
+    }
+
+    LeaveCriticalSection(&lock);
+    DeleteCriticalSection(&lock);
+}
+
 BOOL ProcessDetach(HMODULE hDll)
 {
     ThreadDetach(hDll);
@@ -552,16 +769,19 @@ BOOL ProcessDetach(HMODULE hDll)
         Syelog(SYELOG_SEVERITY_FATAL, "### Error detaching detours: %d\n", error);
     }
 
+    DumpTraces();
+
     Syelog(SYELOG_SEVERITY_NOTICE, "### Closing.\n");
     SyelogClose(FALSE);
-
-    DeleteCriticalSection(&s_lock);
 
     if (s_nTlsIndent >= 0) {
         TlsFree(s_nTlsIndent);
     }
     if (s_nTlsThread >= 0) {
         TlsFree(s_nTlsThread);
+    }
+    if (s_nTlsNestAlloc >= 0) {
+        TlsFree(s_nTlsNestAlloc);
     }
     return TRUE;
 }
