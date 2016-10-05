@@ -304,8 +304,11 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
         rv = Real_NtAllocateVirtualMemory(ProcessHandle, BaseAddress, ZeroBits,
                                           RegionSize, AllocationType, Protect);
 
-        // We care only the case when the allocation is not 64k-aligned.
-        if (PtrToUlong(*RegionSize) & 0xffff && !TlsGetValue(s_nTlsNestAlloc)) {
+        // We care only the case when the size is not 64k-aligned and the type
+        // is MEM_RESERVE or MEM_RESERVE | MEM_COMMIT.
+        // TODO: configurable fitler for the type and protect flag.
+        if (rv >= 0 && PtrToUlong(*RegionSize) & 0xffff &&
+            AllocationType & MEM_RESERVE && !TlsGetValue(s_nTlsNestAlloc)) {
             TlsSetValue(s_nTlsNestAlloc, (LPVOID)1);
 
             ULONG hash;
