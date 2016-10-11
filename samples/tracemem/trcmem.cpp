@@ -14,8 +14,10 @@
 
 #include <windows.h>
 #include <dbghelp.h>
-#include <stdio.h>
+
 #include <map>
+#include <vector>
+
 #include "detours.h"
 #include "syelog.h"
 
@@ -275,13 +277,17 @@ typedef struct
     SIZE_T size;
     ULONG type;
     ULONG protect;
+    DWORD allocTime;
+    DWORD deallocTime;
 } Allocation;
 
 typedef std::map<ULONG, PVOID*, std::less<ULONG>, MyHeapAllocator<std::pair<ULONG, PVOID*>>> StackMap;
 typedef std::multimap<ULONG, Allocation*, std::less<ULONG>, MyHeapAllocator<std::pair<ULONG, Allocation*>>> AllocMap;
+typedef std::map<PVOID, Allocation*, std::less<PVOID>, MyHeapAllocator<std::pair<PVOID, Allocation*>>> LiveMap;
 
 static StackMap s_stacks;
 static AllocMap s_allocs;
+static LiveMap s_lives;
 static LONG s_nTlsNestAlloc;
 
 NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
@@ -305,7 +311,9 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
                                           RegionSize, AllocationType, Protect);
 
         // We care only the case when the size is not 64k-aligned and the type
-        // is MEM_RESERVE or MEM_RESERVE | MEM_COMMIT.
+        // is MEM_RESERVE or MEM_RESERVE | MEM_COMMIT. Because a 64k-unaligned
+        // MEM_COMMIT allocation within a 64k-aligned reserved region doesn't
+        // really cause fragmentation.
         // TODO: configurable fitler for the type and protect flag.
         if (rv >= 0 && PtrToUlong(*RegionSize) & 0xffff &&
             AllocationType & MEM_RESERVE && !TlsGetValue(s_nTlsNestAlloc)) {
@@ -327,7 +335,9 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
             alloc->size = *RegionSize;
             alloc->type = AllocationType;
             alloc->protect = Protect;
+            alloc->allocTime = GetTickCount();
             s_allocs.insert(std::pair<ULONG, Allocation*>(hash, alloc));
+            s_lives.insert(std::pair<PVOID, Allocation*>(*BaseAddress, alloc));
 
             TlsSetValue(s_nTlsNestAlloc, (LPVOID)0);
         }
@@ -342,7 +352,7 @@ NTSTATUS __stdcall Mine_NtFreeVirtualMemory(HANDLE ProcessHandle,
                                             PSIZE_T RegionSize,
                                             ULONG FreeType)
 {
-    _PrintEnter("NtFreeVirtualMemory(%p,%p,%Iu,%x)\n",
+    _PrintEnter("NtFreeVirtualMemory(%p,%p,%lu,%x)\n",
                 ProcessHandle,
                 BaseAddress,
                 RegionSize,
@@ -352,6 +362,14 @@ NTSTATUS __stdcall Mine_NtFreeVirtualMemory(HANDLE ProcessHandle,
     __try {
         rv = Real_NtFreeVirtualMemory(ProcessHandle, BaseAddress, RegionSize,
                                       FreeType);
+        if (rv >= 0) {
+            LiveMap::iterator it = s_lives.find(*BaseAddress);
+            if (it != s_lives.end()) {
+                Allocation* alloc = it->second;
+                alloc->deallocTime = GetTickCount();
+                s_lives.erase(it);
+            }
+        }
     } __finally {
         _PrintExit("NtFreeVirtualMemory(,,,) -> %x\n", rv);
     }
@@ -678,7 +696,7 @@ BOOL ProcessAttach(HMODULE hDll)
 
     SyelogOpen("trcmem" DETOURS_STRINGIFY(DETOURS_BITS), SYELOG_FACILITY_APPLICATION);
     Syelog(SYELOG_SEVERITY_INFORMATION, "##########################################\n");
-    Syelog(SYELOG_SEVERITY_INFORMATION, "### %ls\n", wzExePath);
+    Syelog(SYELOG_SEVERITY_INFORMATION, "%lu ### %ls\n", GetTickCount(), wzExePath);
 
     LONG error = AttachDetours();
     if (error != NO_ERROR) {
@@ -687,69 +705,87 @@ BOOL ProcessAttach(HMODULE hDll)
 
     ThreadAttach(hDll);
 
-    s_bLog = TRUE;
+//    s_bLog = TRUE;
     return TRUE;
+}
+
+VOID Split(const PCHAR s, PCHAR delim, std::vector<PCHAR> &elems)
+{
+    PCHAR p = strtok(s, delim);
+    while (p) {
+        elems.push_back(p);
+        p = strtok(NULL, delim);
+    }
 }
 
 VOID DumpTraces(VOID)
 {
-    static CHAR s_symbuf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)];
     HANDLE hProcess = GetCurrentProcess();
     CRITICAL_SECTION lock;
+    std::vector<PCHAR> skipSymbols;
+
+    Split(getenv("TRCMEM_SKIP_SYMBOLS"), ",", skipSymbols);
 
     InitializeCriticalSection(&lock);
     EnterCriticalSection(&lock);
 
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    // TODO: get sympath from command line or env
-    if (!SymInitialize(hProcess, "C:\\w\\fx\\mc\\obj-i686-pc-mingw32\\dist\\bin;"
-            "SRV*c:\\symcache\\*http://msdl.microsoft.com/download/symbols", TRUE)) {
+    if (!SymInitialize(hProcess, NULL, TRUE)) {
         DWORD error = GetLastError();
         Syelog(SYELOG_SEVERITY_FATAL, "### Error initializing the symbol handler"
                ": %d\n", error);
     }
 
-    PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)s_symbuf;
+    CHAR symbuf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)];
+    PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)symbuf;
     DWORD64 dwDisplacement = 0;
     IMAGEHLP_MODULE64 module;
 
-    memset(&module, 0, sizeof(module));
-    module.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
-    memset(s_symbuf, 0, sizeof(s_symbuf));
-    pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-    pSymbol->MaxNameLen = MAX_SYM_NAME;
-
-    // TODO: apply filter
     for (StackMap::iterator it = s_stacks.begin(); it != s_stacks.end(); ++it) {
         INT i;
         PVOID* stack = it->second;
-        Syelog(SYELOG_SEVERITY_INFORMATION, "0x%x %p\n", it->first, it->second);
+        std::vector<std::string> bt;
 
-        /* Output the stack symbols. */
+        /* Retrieve the stack symbols. */
         for (i = 0; i < STACK_DEPTH && stack[i]; ++i) {
-            SymGetModuleInfo64(hProcess, (DWORD64)stack[i], &module);
+            memset(symbuf, 0, sizeof(symbuf));
+            pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            pSymbol->MaxNameLen = MAX_SYM_NAME;
             SymFromAddr(hProcess, (DWORD64)stack[i], &dwDisplacement, pSymbol);
 
-            Syelog(SYELOG_SEVERITY_INFORMATION, "  [%d] %p %s!%s+0x%x\n", i,
-                   stack[i], module.ModuleName, pSymbol->Name, dwDisplacement);
+            for (auto const& sym: skipSymbols) {
+                if (!strcmp(sym, pSymbol->Name)) {
+                    goto skip;
+                }
+            }
 
             memset(&module, 0, sizeof(module));
             module.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
-            memset(s_symbuf, 0, sizeof(s_symbuf));
-            pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-            pSymbol->MaxNameLen = MAX_SYM_NAME;
-        }
-        HeapFree(s_hMyHeap, 0, stack);
+            SymGetModuleInfo64(hProcess, (DWORD64)stack[i], &module);
 
-        /* List s_allocs from the current stack. */
+            // Reuse symbuf as its size is larger than the prefix of a frame.
+            sprintf(symbuf, "  [%d] %p %s!%s+0x%llx\n", i,
+                    stack[i], module.ModuleName, pSymbol->Name, dwDisplacement);
+            bt.push_back(symbuf);
+        }
+
+        Syelog(SYELOG_SEVERITY_INFORMATION, "0x%x %p\n", it->first, it->second);
+        for (auto &frame: bt) {
+            Syelog(SYELOG_SEVERITY_INFORMATION, frame.c_str());
+        }
+
+        /* List all the allocations from the current stack. */
         std::pair <AllocMap::iterator, AllocMap::iterator> allocs =
             s_allocs.equal_range(it->first);
         i = 0;
         for (AllocMap::iterator it = allocs.first; it != allocs.second; ++it) {
-            Syelog(SYELOG_SEVERITY_INFORMATION, "  #%d %p %lu %x %x\n", ++i,
+            Syelog(SYELOG_SEVERITY_INFORMATION, "  #%d %p %lu %x %x %lu %lu\n", ++i,
                    it->second->addr, it->second->size, it->second->type,
-                   it->second->protect);
+                   it->second->protect, it->second->allocTime, it->second->deallocTime);
         }
+
+skip:
+        HeapFree(s_hMyHeap, 0, stack);
     }
 
     if (!SymCleanup(hProcess)) {
@@ -774,7 +810,7 @@ BOOL ProcessDetach(HMODULE hDll)
 
     DumpTraces();
 
-    Syelog(SYELOG_SEVERITY_NOTICE, "### Closing.\n");
+    Syelog(SYELOG_SEVERITY_NOTICE, "%lu ### Closing.\n", GetTickCount());
     SyelogClose(FALSE);
 
     if (s_nTlsIndent >= 0) {
