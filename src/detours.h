@@ -326,6 +326,32 @@ typedef BOOL (WINAPI *PDETOUR_CREATE_PROCESS_ROUTINEW)
      LPSTARTUPINFOW lpStartupInfo,
      LPPROCESS_INFORMATION lpProcessInformation);
 
+typedef BOOL (WINAPI *PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEA)
+    (HANDLE hToken,
+     LPCSTR lpApplicationName,
+     LPSTR lpCommandLine,
+     LPSECURITY_ATTRIBUTES lpProcessAttributes,
+     LPSECURITY_ATTRIBUTES lpThreadAttributes,
+     BOOL bInheritHandles,
+     DWORD dwCreationFlags,
+     LPVOID lpEnvironment,
+     LPCSTR lpCurrentDirectory,
+     LPSTARTUPINFOA lpStartupInfo,
+     LPPROCESS_INFORMATION lpProcessInformation);
+
+typedef BOOL (WINAPI *PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEW)
+    (HANDLE hToken,
+     LPCWSTR lpApplicationName,
+     LPWSTR lpCommandLine,
+     LPSECURITY_ATTRIBUTES lpProcessAttributes,
+     LPSECURITY_ATTRIBUTES lpThreadAttributes,
+     BOOL bInheritHandles,
+     DWORD dwCreationFlags,
+     LPVOID lpEnvironment,
+     LPCWSTR lpCurrentDirectory,
+     LPSTARTUPINFOW lpStartupInfo,
+     LPPROCESS_INFORMATION lpProcessInformation);
+
 BOOL WINAPI DetourCreateProcessWithDllA(LPCSTR lpApplicationName,
                                         __in_z LPSTR lpCommandLine,
                                         LPSECURITY_ATTRIBUTES lpProcessAttributes,
@@ -396,6 +422,48 @@ BOOL WINAPI DetourCreateProcessWithDllExW(LPCWSTR lpApplicationName,
 #else
 #define DetourCreateProcessWithDllEx    DetourCreateProcessWithDllExA
 #define PDETOUR_CREATE_PROCESS_ROUTINE  PDETOUR_CREATE_PROCESS_ROUTINEA
+#endif // !UNICODE
+
+BOOL WINAPI DetourCreateProcessAsUserWithDllExA(HANDLE hToken,
+                                                LPCSTR lpApplicationName,
+                                                __in_z LPSTR lpCommandLine,
+                                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                                BOOL bInheritHandles,
+                                                DWORD dwCreationFlags,
+                                                LPVOID lpEnvironment,
+                                                LPCSTR lpCurrentDirectory,
+                                                LPSTARTUPINFOA lpStartupInfo,
+                                                LPPROCESS_INFORMATION lpProcessInformation,
+                                                LPCSTR lpDllName,
+                                                PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEA
+                                                pfCreateProcessAsUserA,
+                                                PDETOUR_CREATE_PROCESS_ROUTINEA
+                                                pfCreateProcessA);
+
+BOOL WINAPI DetourCreateProcessAsUserWithDllExW(HANDLE hToken,
+                                                LPCWSTR lpApplicationName,
+                                                __in_z LPWSTR lpCommandLine,
+                                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                                BOOL bInheritHandles,
+                                                DWORD dwCreationFlags,
+                                                LPVOID lpEnvironment,
+                                                LPCWSTR lpCurrentDirectory,
+                                                LPSTARTUPINFOW lpStartupInfo,
+                                                LPPROCESS_INFORMATION lpProcessInformation,
+                                                LPCSTR lpDllName,
+                                                PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEW
+                                                pfCreateProcessAsUserW,
+                                                PDETOUR_CREATE_PROCESS_ROUTINEW
+                                                pfCreateProcessW);
+
+#ifdef UNICODE
+#define DetourCreateProcessAsUserWithDllEx     DetourCreateProcessAsUserWithDllExW
+#define PDETOUR_CREATE_PROCESS_AS_USER_ROUTINE PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEW
+#else
+#define DetourCreateProcessAsUserWithDllEx     DetourCreateProcessAsUserWithDllExA
+#define PDETOUR_CREATE_PROCESS_AS_USER_ROUTINE PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEA
 #endif // !UNICODE
 
 BOOL WINAPI DetourProcessViaHelperA(DWORD dwTargetPid,

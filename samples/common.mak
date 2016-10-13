@@ -76,7 +76,7 @@ CFLAGS=$(CFLAGS) /DDETOURS_OPTION_BITS=$(DETOURS_OPTION_BITS)
 !ENDIF
 
 LIBS = $(LIBD)\syelog.lib $(LIBD)\detours.lib \
-        kernel32.lib gdi32.lib user32.lib shell32.lib
+        kernel32.lib gdi32.lib user32.lib shell32.lib advapi32.lib
 DEPS = $(LIBD)\syelog.lib $(LIBD)\detours.lib
 
 ##############################################################################

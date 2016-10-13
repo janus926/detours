@@ -1357,5 +1357,143 @@ BOOL WINAPI DetourCreateProcessWithDllExW(LPCWSTR lpApplicationName,
     return TRUE;
 }
 
+BOOL WINAPI DetourCreateProcessAsUserWithDllExA(HANDLE hToken,
+                                                LPCSTR lpApplicationName,
+                                                __in_z LPSTR lpCommandLine,
+                                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                                BOOL bInheritHandles,
+                                                DWORD dwCreationFlags,
+                                                LPVOID lpEnvironment,
+                                                LPCSTR lpCurrentDirectory,
+                                                LPSTARTUPINFOA lpStartupInfo,
+                                                LPPROCESS_INFORMATION lpProcessInformation,
+                                                LPCSTR lpDllName,
+                                                PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEA
+                                                pfCreateProcessAsUserA,
+                                                PDETOUR_CREATE_PROCESS_ROUTINEA
+                                                pfCreateProcessA)
+{
+    if (pfCreateProcessAsUserA == NULL) {
+        pfCreateProcessAsUserA = CreateProcessAsUserA;
+    }
+    if (pfCreateProcessA == NULL) {
+        pfCreateProcessA = CreateProcessA;
+    }
+
+    PROCESS_INFORMATION backup;
+    if (lpProcessInformation == NULL) {
+        lpProcessInformation = &backup;
+        ZeroMemory(&backup, sizeof(backup));
+    }
+
+    if (!pfCreateProcessAsUserA(hToken,
+                                lpApplicationName,
+                                lpCommandLine,
+                                lpProcessAttributes,
+                                lpThreadAttributes,
+                                bInheritHandles,
+                                dwCreationFlags | CREATE_SUSPENDED,
+                                lpEnvironment,
+                                lpCurrentDirectory,
+                                lpStartupInfo,
+                                lpProcessInformation)) {
+        return FALSE;
+    }
+
+    LPCSTR szDll = lpDllName;
+
+    if (!DetourUpdateProcessWithDll(lpProcessInformation->hProcess, &szDll, 1) &&
+        !DetourProcessViaHelperA(lpProcessInformation->dwProcessId,
+                                 lpDllName,
+                                 pfCreateProcessA)) {
+
+        TerminateProcess(lpProcessInformation->hProcess, ~0u);
+        CloseHandle(lpProcessInformation->hProcess);
+        CloseHandle(lpProcessInformation->hThread);
+        return FALSE;
+    }
+
+    if (!(dwCreationFlags & CREATE_SUSPENDED)) {
+        ResumeThread(lpProcessInformation->hThread);
+    }
+
+    if (lpProcessInformation == &backup) {
+        CloseHandle(lpProcessInformation->hProcess);
+        CloseHandle(lpProcessInformation->hThread);
+    }
+
+    return TRUE;
+}
+
+BOOL WINAPI DetourCreateProcessAsUserWithDllExW(HANDLE hToken,
+                                                LPCWSTR lpApplicationName,
+                                                __in_z LPWSTR lpCommandLine,
+                                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                                BOOL bInheritHandles,
+                                                DWORD dwCreationFlags,
+                                                LPVOID lpEnvironment,
+                                                LPCWSTR lpCurrentDirectory,
+                                                LPSTARTUPINFOW lpStartupInfo,
+                                                LPPROCESS_INFORMATION lpProcessInformation,
+                                                LPCSTR lpDllName,
+                                                PDETOUR_CREATE_PROCESS_AS_USER_ROUTINEW
+                                                pfCreateProcessAsUserW,
+                                                PDETOUR_CREATE_PROCESS_ROUTINEW
+                                                pfCreateProcessW)
+{
+    if (pfCreateProcessAsUserW == NULL) {
+        pfCreateProcessAsUserW = CreateProcessAsUserW;
+    }
+    if (pfCreateProcessW == NULL) {
+        pfCreateProcessW = CreateProcessW;
+    }
+
+    PROCESS_INFORMATION backup;
+    if (lpProcessInformation == NULL) {
+        lpProcessInformation = &backup;
+        ZeroMemory(&backup, sizeof(backup));
+    }
+
+    if (!pfCreateProcessAsUserW(hToken,
+                                lpApplicationName,
+                                lpCommandLine,
+                                lpProcessAttributes,
+                                lpThreadAttributes,
+                                bInheritHandles,
+                                dwCreationFlags | CREATE_SUSPENDED,
+                                lpEnvironment,
+                                lpCurrentDirectory,
+                                lpStartupInfo,
+                                lpProcessInformation)) {
+        return FALSE;
+    }
+
+
+    LPCSTR sz = lpDllName;
+
+    if (!DetourUpdateProcessWithDll(lpProcessInformation->hProcess, &sz, 1) &&
+        !DetourProcessViaHelperW(lpProcessInformation->dwProcessId,
+                                 lpDllName,
+                                 pfCreateProcessW)) {
+
+        TerminateProcess(lpProcessInformation->hProcess, ~0u);
+        CloseHandle(lpProcessInformation->hProcess);
+        CloseHandle(lpProcessInformation->hThread);
+        return FALSE;
+    }
+
+    if (!(dwCreationFlags & CREATE_SUSPENDED)) {
+        ResumeThread(lpProcessInformation->hThread);
+    }
+
+    if (lpProcessInformation == &backup) {
+        CloseHandle(lpProcessInformation->hProcess);
+        CloseHandle(lpProcessInformation->hThread);
+    }
+    return TRUE;
+}
+
 //
 ///////////////////////////////////////////////////////////////// End of File.

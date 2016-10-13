@@ -16,6 +16,7 @@
 #include <dbghelp.h>
 
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "detours.h"
@@ -252,22 +253,27 @@ BOOL WINAPI Mine_CreateProcessW(LPCWSTR lpApplicationName,
     return rv;
 }
 
-static HANDLE s_hMyHeap;
+struct HeapDeleter
+{
+    typedef HANDLE pointer;
+    void operator()(HANDLE h) { HeapDestroy(h); }
+};
+static std::unique_ptr<HANDLE, HeapDeleter> s_hMyHeap(HeapCreate(0, 0, 0),
+                                                      HeapDeleter());
 
 template<class T>
 struct MyHeapAllocator
 {
     typedef T value_type;
-    MyHeapAllocator() { if (!s_hMyHeap) s_hMyHeap = HeapCreate(0, 0, 0); }
-    ~MyHeapAllocator() { if (s_hMyHeap) HeapDestroy(s_hMyHeap); }
+    MyHeapAllocator() {}
     template<class U> MyHeapAllocator(const MyHeapAllocator<U>& other) {}
     template<class U> bool operator==(const MyHeapAllocator<U>&) { return true; }
     template<class U> bool operator!=(const MyHeapAllocator<U>&) { return false; }
     T* allocate(size_t n) {
-        return static_cast<T*>(HeapAlloc(s_hMyHeap, 0, n * sizeof(T)));
+        return static_cast<T*>(HeapAlloc(s_hMyHeap.get(), 0, n * sizeof(T)));
     }
     void deallocate(T* p, size_t n) {
-        HeapFree(s_hMyHeap, 0, p);
+        HeapFree(s_hMyHeap.get(), 0, p);
     }
 };
 
@@ -297,7 +303,7 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
                                                 ULONG AllocationType,
                                                 ULONG Protect)
 {
-    _PrintEnter("NtAllocateVirtualMemory(%p,%p,%x,%Iu,%x,%x)\n",
+    _PrintEnter("NtAllocateVirtualMemory(%p,%p,%x,%lu,%x,%x)\n",
                 ProcessHandle,
                 *BaseAddress,
                 ZeroBits,
@@ -320,16 +326,17 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
             TlsSetValue(s_nTlsNestAlloc, (LPVOID)1);
 
             ULONG hash;
-            PVOID* bt = (PVOID*)HeapAlloc(s_hMyHeap, HEAP_ZERO_MEMORY,
+            PVOID* bt = (PVOID*)HeapAlloc(s_hMyHeap.get(), HEAP_ZERO_MEMORY,
                                           sizeof(PVOID) * STACK_DEPTH);
             (CaptureStackBackTrace)(1, STACK_DEPTH, bt, &hash);
             if (s_stacks.find(hash) != s_stacks.end()) {
-                HeapFree(s_hMyHeap, 0, bt);
+                HeapFree(s_hMyHeap.get(), 0, bt);
             } else {
                 s_stacks.insert(std::pair<ULONG, PVOID*>(hash, bt));
             }
 
-            Allocation* alloc = (Allocation*)HeapAlloc(s_hMyHeap, HEAP_ZERO_MEMORY,
+            Allocation* alloc = (Allocation*)HeapAlloc(s_hMyHeap.get(),
+                                                       HEAP_ZERO_MEMORY,
                                                        sizeof(Allocation));
             alloc->addr = *BaseAddress;
             alloc->size = *RegionSize;
@@ -362,7 +369,7 @@ NTSTATUS __stdcall Mine_NtFreeVirtualMemory(HANDLE ProcessHandle,
     __try {
         rv = Real_NtFreeVirtualMemory(ProcessHandle, BaseAddress, RegionSize,
                                       FreeType);
-        if (rv >= 0) {
+        if (rv >= 0 && (FreeType | MEM_RELEASE)) {
             LiveMap::iterator it = s_lives.find(*BaseAddress);
             if (it != s_lives.end()) {
                 Allocation* alloc = it->second;
@@ -401,20 +408,22 @@ BOOL WINAPI Mine_CreateProcessAsUserW(HANDLE hToken,
                 lpStartupInfo,
                 lpProcessInformation);
 
-    BOOL rv;
+    BOOL rv = 0;
     __try {
-        // TODO: Maybe DetourCreateProcessWithDllExW?
-        rv = Real_CreateProcessAsUserW(hToken,
-                                       lpApplicationName,
-                                       lpCommandLine,
-                                       lpProcessAttributes,
-                                       lpThreadAttributes,
-                                       bInheritHandles,
-                                       dwCreationFlags,
-                                       lpEnvironment,
-                                       lpCurrentDirectory,
-                                       lpStartupInfo,
-                                       lpProcessInformation);
+        rv = DetourCreateProcessAsUserWithDllExW(hToken,
+                                                 lpApplicationName,
+                                                 lpCommandLine,
+                                                 lpProcessAttributes,
+                                                 lpThreadAttributes,
+                                                 bInheritHandles,
+                                                 dwCreationFlags,
+                                                 lpEnvironment,
+                                                 lpCurrentDirectory,
+                                                 lpStartupInfo,
+                                                 lpProcessInformation,
+                                                 s_szDllPath,
+                                                 Real_CreateProcessAsUserW,
+                                                 Real_CreateProcessW);
     } __finally {
         _PrintExit("CreateProcessAsUser(,,,,,,,,,,) -> %x\n", rv);
     }
@@ -711,6 +720,9 @@ BOOL ProcessAttach(HMODULE hDll)
 
 VOID Split(const PCHAR s, PCHAR delim, std::vector<PCHAR> &elems)
 {
+    if (!s || !delim) {
+        return;
+    }
     PCHAR p = strtok(s, delim);
     while (p) {
         elems.push_back(p);
@@ -724,7 +736,7 @@ VOID DumpTraces(VOID)
     CRITICAL_SECTION lock;
     std::vector<PCHAR> skipSymbols;
 
-    Split(getenv("TRCMEM_SKIP_SYMBOLS"), ",", skipSymbols);
+    Split(getenv("TRCMEM_SKIP_STACK_WITH_SYMBOL"), ",", skipSymbols);
 
     InitializeCriticalSection(&lock);
     EnterCriticalSection(&lock);
@@ -785,7 +797,7 @@ VOID DumpTraces(VOID)
         }
 
 skip:
-        HeapFree(s_hMyHeap, 0, stack);
+        HeapFree(s_hMyHeap.get(), 0, stack);
     }
 
     if (!SymCleanup(hProcess)) {
