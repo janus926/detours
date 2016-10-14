@@ -691,10 +691,6 @@ static BOOL syelogIsOpen(PFILETIME pftLog)
         if (Real_SetNamedPipeHandleState(s_hPipe, &dwMode, NULL, NULL)) {
             return TRUE;
         }
-    } else {
-        char buf[128] = {0};
-        sprintf(buf, "GetLastError=%d\n", GetLastError());
-        OutputDebugString(buf);
     }
 
     if (Real_WaitNamedPipeW(SYELOG_PIPE_NAMEW, 2000)) { // Wait 2 seconds.
