@@ -504,21 +504,13 @@ DWORD WINAPI WorkerThread(LPVOID pvVoid)
         b = GetQueuedCompletionStatus(hCompletionPort,
                                       &nBytes, (PULONG_PTR)&pClient, &lpo, INFINITE);
 
-        if (!b || lpo == NULL) {
-            fKeepLooping = FALSE;
-            MyErrExit("GetQueuedCompletionState");
-            break;
-        }
-        else if (!b) {
-            if (pClient) {
-                if (GetLastError() == ERROR_BROKEN_PIPE) {
-                    LogMessageV(SYELOG_SEVERITY_INFORMATION, "Client closed pipe.");
-                }
-                else {
-                    LogMessageV(SYELOG_SEVERITY_ERROR,
-                                "GetQueuedCompletionStatus failed %d [%p]",
-                                GetLastError(), pClient);
-                }
+        if (!b) {
+            if (GetLastError() != ERROR_BROKEN_PIPE) {
+                LogMessageV(SYELOG_SEVERITY_ERROR,
+                            "GetQueuedCompletionStatus failed %d [%p]",
+                            GetLastError(), pClient);
+            }
+            if (lpo && pClient) {
                 CloseConnection(pClient);
             }
             continue;
