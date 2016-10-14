@@ -66,6 +66,8 @@ VOID _VPrint(PCSTR msg, va_list args, PCHAR pszBuf, LONG cbBuf);
 
 VOID AssertMessage(CONST PCHAR pszMsg, CONST PCHAR pszFile, ULONG nLine);
 
+BOOL ProcessDetach(HMODULE hDll);
+
 //////////////////////////////////////////////////////////////////////////////
 // Trampolines
 //
@@ -187,6 +189,10 @@ BOOL (WINAPI * Real_CreateProcessAsUserW)(HANDLE a0,
                                           LPSTARTUPINFOW a9,
                                           LPPROCESS_INFORMATION a10)
     = CreateProcessAsUserW;
+
+BOOL (WINAPI * Real_TerminateProcess)(HANDLE a0,
+                                      UINT a1)
+    = TerminateProcess;
 
 //////////////////////////////////////////////////////////////////////////////
 // Detours
@@ -430,6 +436,27 @@ BOOL WINAPI Mine_CreateProcessAsUserW(HANDLE hToken,
     return rv;
 }
 
+BOOL WINAPI Mine_TerminateProcess(HANDLE hProcess,
+                                  UINT uExitCode)
+{
+    _PrintEnter("TerminateProcess(%p,%u)\n",
+                hProcess,
+                uExitCode);
+
+    BOOL rv = 0;
+    __try {
+        // We won't receive DLL_PROCESS_DETACH notification if the process is
+        // terminated by TerminateProcess, so we need to handle it here.
+        if (hProcess == GetCurrentProcess()) {
+            ProcessDetach(NULL);
+        }
+        rv = Real_TerminateProcess(hProcess, uExitCode);
+    } __finally {
+        _PrintExit("TerminateProcess(,) -> %x\n", rv);
+    }
+    return rv;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // AttachDetours
 //
@@ -504,6 +531,7 @@ LONG AttachDetours(VOID)
     ATTACH(HeapAlloc);
     ATTACH(NtAllocateVirtualMemory);
     ATTACH(NtFreeVirtualMemory);
+    ATTACH(TerminateProcess);
 
     return DetourTransactionCommit();
 }
@@ -518,6 +546,7 @@ LONG DetachDetours(VOID)
     DETACH(HeapAlloc);
     DETACH(NtAllocateVirtualMemory);
     DETACH(NtFreeVirtualMemory);
+    DETACH(TerminateProcess);
 
     return DetourTransactionCommit();
 }

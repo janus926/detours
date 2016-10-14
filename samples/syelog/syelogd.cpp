@@ -7,10 +7,12 @@
 //  Copyright (c) Microsoft Corporation.  All rights reserved.
 //
 #include <windows.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <tchar.h>
 #include "syelog.h"
 
 #if (_MSC_VER < 1299)
@@ -158,10 +160,147 @@ BOOL CloseConnection(PCLIENT pClient)
     return TRUE;
 }
 
+// The following code piece for anonymous PIPE access is from
+// http://blog.m-ri.de/wp-content/uploads/2009/12/TestAnonymousPipe.zip
+class SEC
+{
+    // Class to handle security attributes
+public:
+    SEC() : psd(NULL), pTokenUser(NULL) {}
+    ~SEC() { LocalFree(psd); LocalFree(pTokenUser); }
+    BOOL BuildSecurityAttributes(SECURITY_ATTRIBUTES *psa);
+
+private:
+    BOOL GetUserSid(PSID *ppSidUser);
+
+    PSECURITY_DESCRIPTOR psd;
+    PTOKEN_USER pTokenUser;
+};
+
+BOOL SEC::BuildSecurityAttributes(SECURITY_ATTRIBUTES *psa)
+{
+    if (psd)
+        return FALSE;
+
+    PSID pSidUser;
+    if (!GetUserSid(&pSidUser)) {
+        LogMessageV(SYELOG_SEVERITY_ERROR, "GetUserSid failed");
+        return FALSE;
+    }
+
+    LPTSTR pszSidUser;
+    if (!ConvertSidToStringSid(pSidUser,&pszSidUser)) {
+        LogMessageV(SYELOG_SEVERITY_ERROR,
+                    "ConvertSidToStringSid failed %d", GetLastError());
+        return FALSE;
+    }
+
+    TCHAR szBuff[1024];
+    // Start of DACL
+    _tcscpy(szBuff,_T("D:"));
+    // GENERIC_ALL access to current user
+    _tcscat(szBuff,_T("(A;;GA;;;"));
+    _tcscat(szBuff,pszSidUser);
+    _tcscat(szBuff,_T(")"));
+    // GENERIC_READ/WRITE to anonymous users
+    _tcscat(szBuff,_T("(A;;GWGR;;;AN)"));
+    // GENERIC_READ/WRITE to everyone
+    _tcscat(szBuff,_T("(A;;GWGR;;;WD)"));
+
+    // Free user sid again
+    LocalFree(pszSidUser);
+
+    // We need this only if we have Windows Vista, Windows 7 or Windows 2008 Server
+    OSVERSIONINFO osvi;
+    osvi.dwOSVersionInfoSize = sizeof(osvi);
+    if (!GetVersionEx(&osvi)) {
+        LogMessageV(SYELOG_SEVERITY_ERROR, "GetVersionEx failed %d", GetLastError());
+        return FALSE;
+    }
+
+    // If Vista, Server 2008, or Windows7!
+    if (osvi.dwMajorVersion >= 6) {
+        // Now the trick with the SACL:
+        // We set SECURITY_MANDATORY_UNTRUSTED_RID to SYSTEM_MANDATORY_POLICY_NO_WRITE_UP
+        // Anonymous access is untrusted, and this process runs equal or above medium
+        // integrity level. Setting "S:(ML;;NW;;;LW)" is not sufficient.
+        _tcscat(szBuff,_T("S:(ML;;NW;;;S-1-16-0)"));
+    }
+
+    // Get the SD
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(szBuff,
+                                                             SDDL_REVISION_1,
+                                                             &psd,
+                                                             NULL)) {
+        LogMessageV(SYELOG_SEVERITY_ERROR,
+                    "ConvertStringSecurityDescriptorToSecurityDescriptor failed %d",
+                    GetLastError());
+        return FALSE;
+    }
+
+    psa->nLength = sizeof(SECURITY_ATTRIBUTES);
+    psa->bInheritHandle = TRUE;
+    psa->lpSecurityDescriptor = psd;
+
+    return TRUE;
+}
+
+BOOL SEC::GetUserSid(PSID *ppSidUser)
+{
+    HANDLE hToken;
+    DWORD dwLength;
+    DWORD cbName = 250;
+    DWORD cbDomainName = 250;
+
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hToken)) {
+        if (GetLastError() == ERROR_NO_TOKEN) {
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+                return FALSE;
+            }
+        } else {
+            return FALSE;
+        }
+    }
+
+    if (!GetTokenInformation(hToken,       // handle of the access token
+                             TokenUser,    // type of information to retrieve
+                             pTokenUser,   // address of retrieved information
+                             0,            // size of the information buffer
+                             &dwLength)) { // address of required buffer size
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+            pTokenUser = (PTOKEN_USER)LocalAlloc(LPTR, dwLength);
+            if (!pTokenUser) {
+                return FALSE;
+            }
+        } else {
+            return FALSE;
+        }
+    }
+
+    if (!GetTokenInformation(hToken,       // handle of the access token
+                             TokenUser,    // type of information to retrieve
+                             pTokenUser,   // address of retrieved information
+                             dwLength,     // size of the information buffer
+                             &dwLength)) { // address of required buffer size
+        LocalFree(pTokenUser);
+        pTokenUser = NULL;
+        return FALSE;
+    }
+
+    *ppSidUser = pTokenUser->User.Sid;
+    return TRUE;
+}
+
 // Creates a pipe instance and initiate an accept request.
 //
 PCLIENT CreatePipeConnection(HANDLE hCompletionPort)
 {
+    // Let the PIPE to be anonymous accessible, so even a child process is with
+    // lower integrity level, it can still write to the PIPE.
+    SEC sec;
+    SECURITY_ATTRIBUTES sa;
+    sec.BuildSecurityAttributes(&sa);
+
     HANDLE hPipe = CreateNamedPipe(SYELOG_PIPE_NAME,           // pipe name
                                    PIPE_ACCESS_INBOUND |       // read-only access
                                    FILE_FLAG_OVERLAPPED,       // overlapped mode
@@ -172,7 +311,7 @@ PCLIENT CreatePipeConnection(HANDLE hCompletionPort)
                                    0,                          // output buffer size
                                    0,                          // input buffer size
                                    20000,                      // client time-out
-                                   NULL);                      // no security attributes
+                                   &sa);                       // anonymous accessible
     if (hPipe == INVALID_HANDLE_VALUE) {
         MyErrExit("CreatePipe");
     }
