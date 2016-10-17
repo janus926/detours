@@ -300,6 +300,7 @@ typedef std::map<PVOID, Allocation*, std::less<PVOID>, MyHeapAllocator<std::pair
 static StackMap s_stacks;
 static AllocMap s_allocs;
 static LiveMap s_lives;
+static CRITICAL_SECTION s_lock;
 static LONG s_nTlsNestAlloc;
 
 NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
@@ -350,7 +351,9 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
             alloc->protect = Protect;
             alloc->allocTime = GetTickCount();
             s_allocs.insert(std::pair<ULONG, Allocation*>(hash, alloc));
+            EnterCriticalSection(&s_lock);
             s_lives.insert(std::pair<PVOID, Allocation*>(*BaseAddress, alloc));
+            LeaveCriticalSection(&s_lock);
 
             TlsSetValue(s_nTlsNestAlloc, (LPVOID)0);
         }
@@ -376,12 +379,14 @@ NTSTATUS __stdcall Mine_NtFreeVirtualMemory(HANDLE ProcessHandle,
         rv = Real_NtFreeVirtualMemory(ProcessHandle, BaseAddress, RegionSize,
                                       FreeType);
         if (rv >= 0 && (FreeType | MEM_RELEASE)) {
+            EnterCriticalSection(&s_lock);
             LiveMap::iterator it = s_lives.find(*BaseAddress);
             if (it != s_lives.end()) {
                 Allocation* alloc = it->second;
                 alloc->deallocTime = GetTickCount();
                 s_lives.erase(it);
             }
+            LeaveCriticalSection(&s_lock);
         }
     } __finally {
         _PrintExit("NtFreeVirtualMemory(,,,) -> %x\n", rv);
@@ -736,6 +741,8 @@ BOOL ProcessAttach(HMODULE hDll)
     Syelog(SYELOG_SEVERITY_INFORMATION, "##########################################\n");
     Syelog(SYELOG_SEVERITY_INFORMATION, "%lu ### %ls\n", GetTickCount(), wzExePath);
 
+    InitializeCriticalSection(&s_lock);
+
     LONG error = AttachDetours();
     if (error != NO_ERROR) {
         Syelog(SYELOG_SEVERITY_FATAL, "### Error attaching detours: %d\n", error);
@@ -762,13 +769,9 @@ VOID Split(const PCHAR s, PCHAR delim, std::vector<PCHAR> &elems)
 VOID DumpTraces(VOID)
 {
     HANDLE hProcess = GetCurrentProcess();
-    CRITICAL_SECTION lock;
     std::vector<PCHAR> skipSymbols;
 
     Split(getenv("TRCMEM_SKIP_STACK_WITH_SYMBOL"), ",", skipSymbols);
-
-    InitializeCriticalSection(&lock);
-    EnterCriticalSection(&lock);
 
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     if (!SymInitialize(hProcess, NULL, TRUE)) {
@@ -834,9 +837,6 @@ skip:
         Syelog(SYELOG_SEVERITY_FATAL, "### Error terminating the symbol handler"
                ": %d\n", error);
     }
-
-    LeaveCriticalSection(&lock);
-    DeleteCriticalSection(&lock);
 }
 
 BOOL ProcessDetach(HMODULE hDll)
@@ -848,6 +848,8 @@ BOOL ProcessDetach(HMODULE hDll)
     if (error != NO_ERROR) {
         Syelog(SYELOG_SEVERITY_FATAL, "### Error detaching detours: %d\n", error);
     }
+
+    DeleteCriticalSection(&s_lock);
 
     DumpTraces();
 
