@@ -34,6 +34,7 @@
 #define STGOPTIONS          PVOID
 
 #define STACK_DEPTH         64
+#define ALLOC_ALIGNMENT     (64 * 1024)
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -328,7 +329,7 @@ NTSTATUS __stdcall Mine_NtAllocateVirtualMemory(HANDLE ProcessHandle,
         // MEM_COMMIT allocation within a 64k-aligned reserved region doesn't
         // really cause fragmentation.
         // TODO: configurable fitler for the type and protect flag.
-        if (rv >= 0 && PtrToUlong(*RegionSize) & 0xffff &&
+        if (rv >= 0 && PtrToUlong(*RegionSize) & (ALLOC_ALIGNMENT - 1) &&
             AllocationType & MEM_RESERVE && !TlsGetValue(s_nTlsNestAlloc)) {
             TlsSetValue(s_nTlsNestAlloc, (LPVOID)1);
 
